@@ -1,0 +1,22 @@
+# 构建产物
+*.exe
+*.pdb
+dist/
+bin/
+obj/
+
+# 运行时生成
+policy.txt
+TlsFragProxy.log
+*.log
+
+# 编辑器
+.vs/
+.vscode/
+*.user
+*.suo
+.idea/
+
+# 系统
+Thumbs.db
+desktop.ini
