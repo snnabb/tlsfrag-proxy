@@ -1,165 +1,153 @@
-# TlsFragProxy
+# TlsFragProxy v0.4.2
 
-一个只做一件事的本地代理：**把 TLS ClientHello 切成两段、中间停顿一下再发**，让做 TCP 流重组的 DPI 设备拼不出完整的 SNI，从而绕过基于域名黑名单的 HTTPS 阻断。
+![TlsFragProxy icon](assets/TlsFragProxy.png)
 
-> A minimal local proxy that defeats SNI-based DPI by splitting the TLS ClientHello and inserting a delay between the two halves. Written for a campus network that reassembles TCP before matching the SNI field — a case where `--frag-by-sni`, `--disorder` and similar tools do **not** work, because they cannot introduce a delay.
+**中文：** TlsFragProxy 是一个面向 Windows 的本地代理。它读取 TLS ClientHello，找到 SNI 域名后把握手切成两段，并在两段之间加入可配置的停顿，帮助绕过“TCP 能连通，但网关会根据 SNI 重置连接”的网络阻断。
 
-Windows · .NET Framework 4.x · 单文件 22 KB · 无外部依赖
+**English:** TlsFragProxy is a small local proxy for Windows. It reads the TLS ClientHello, locates the SNI name, splits the handshake into two writes, and waits between them. This can help when a network resets connections after matching the SNI even though TCP connectivity itself works.
 
----
+它只负责本地代理和 TLS 分片，不提供境外出口，也不会把无法建立 TCP 连接的目标 IP 变成可访问。它不是 VPN、远程代理或流量加密工具。
 
-## 目录
+It only provides a local proxy and TLS fragmentation. It does not provide an overseas egress, turn an unreachable IP into a reachable one, or act as a VPN, remote proxy, or traffic encryption layer.
 
-- [它解决什么问题](#它解决什么问题)
-- [为什么现有的工具不行](#为什么现有的工具不行)
-- [快速开始](#快速开始)
-- [工作模式](#工作模式)
-- [参数](#参数)
-- [和 Clash / V2Ray 共存](#和-clash--v2ray-共存)
-- [常见问题](#常见问题)
-- [自行构建](#自行构建)
-- [目录结构](#目录结构)
+## 适用范围 / When it helps
 
----
+**中文：** 它适合下面这种现象：
 
-## 它解决什么问题
-
-某些网络的出口网关会对 TLS 握手里的 **SNI 字段**做黑名单匹配，命中就回 RST：
-
-```
-不带 SNI  →  TCP 握手成功，TLS 握手成功，服务器正常返回 HTTP 403
-带 SNI    →  TCP 握手成功，ClientHello 发完，等响应时被 RST（curl exit 35）
-用真实 IP 直连、只改 SNI →  同样被 RST
+```text
+TCP 建连成功
+ClientHello 可以发出
+带域名的 TLS 连接在等待响应时被 RST
+把 ClientHello 分两段，并在中间等待后可以继续握手
 ```
 
-最后一条排除了 DNS 因素 —— 封锁点就在 SNI 字符串上。
+**English:** It is designed for this pattern:
 
-问题在于，这类设备**不是只看第一个包**。把 ClientHello 拆成两个 TCP 段发出去，它会先把两段重组、解析出完整域名、然后再 RST。所以单纯的分段无效。
-
-真正有效的做法是**在两次发送之间插入一段停顿**，让它的重组缓冲区先超时。
-
----
-
-## 为什么现有的工具不行
-
-| 工具 / 参数 | 切点正确 | 能控延时 | 结果 |
-|---|---|---|---|
-| GoodbyeDPI `--frag-by-sni` | ✅ | ❌ 无延时参数 | 落在 30ms 档，失败 |
-| GoodbyeDPI `--disorder` | ✅ | ❌ 0 延时乱序 | 两段几乎同时到达，仍被重组 |
-| zapret `--dpi-desync=split2` | ✅ | ❌ | 同上 |
-| GreenTunnel `--fragment-delay` | ⚠️ 固定字节等分 | ✅ | 可用，但默认参数全错，且不保证切在域名内部 |
-
-实测矩阵（同一网关、同一目标）：
-
-```
-delay\pos |  84  85  86  87  88  89  90  91  92  93  94  95  96  97  98  99
----------------------------------------------------------------------------
-       30 |   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .   .
-      400 |   .   P   P   P   P   .   P   P   P   P   P   P   P   .   P   ?
-      800 |   P   P   P   P   P   P   P   P   P   P   P   P   P   P   P   ?
-     1200 |   P   .   P   P   P   P   P   P   P   P   P   P   P   P   P   ?
-
-P = 握手成功     . = 发完被 RST     ? = 其他
+```text
+TCP connection succeeds
+The ClientHello is sent
+The named TLS connection is reset while waiting for a response
+The handshake succeeds after a delayed split
 ```
 
-两个结论：
+它无法解决 DNS 劫持、目标 IP 完全不可达、HTTP 中间人、证书替换或需要真实上游出口的场景。
 
-1. **30ms 行全灭** → 延时是必要条件，位置换了 16 个也没用。
-2. **位置 99 全灭**（域名是 85~98）→ 两段里任何一段都不能包含完整域名。
+It does not solve DNS hijacking, completely unreachable destination IPs, HTTP interception, certificate replacement, or cases that require a real upstream egress.
 
-所以有效条件是：**「切在域名内部」 × 「延时 > 网关重组缓冲超时」**，两个缺一不可。
+## 快速开始 / Quick start
 
-本项目把这两件事都做对了：切点由 ClientHello 结构动态解析得出，延时可选。
+### 使用发布版 exe / Run the release exe
 
----
+1. **中文：** 下载 `TlsFragProxy.exe`，放到当前用户可写且不与其他账户共享的目录，例如 `C:\Tools\TlsFragProxy`。
+   **English:** Download `TlsFragProxy.exe` and place it in a writable directory owned by the current user, such as `C:\Tools\TlsFragProxy`.
+2. **中文：** 双击启动。程序会出现在系统托盘，并默认把 Windows 系统代理设置为 `127.0.0.1:8899`。
+   **English:** Double-click it. The program appears in the system tray and sets the Windows system proxy to `127.0.0.1:8899` by default.
+3. **中文：** 用浏览器访问目标网站。
+   **English:** Browse to the target site.
+4. **中文：** 右键托盘图标并选择“退出”。正常退出会恢复启动前的系统代理设置。
+   **English:** Right-click the tray icon and choose **Exit**. A normal exit restores the system proxy captured at startup.
 
-## 快速开始
+Windows 可能显示 SmartScreen 提示。程序目前没有数字签名，需要选择“更多信息 → 仍要运行”。
 
-### 方式一：直接跑 exe（推荐）
+Windows may show a SmartScreen warning because the executable is not digitally signed. Choose **More info → Run anyway** if you trust the file.
 
-1. 下载 `TlsFragProxy.exe`
-2. 双击
-3. 托盘出现图标，系统代理自动设为 `127.0.0.1:8899`
-4. 直接用浏览器
+程序会在 exe 同目录保存：
 
-退出：右键托盘 → 退出（会自动把系统代理还原成你原来的设置）。
+The executable stores these files beside itself:
 
-> 如果程序被任务管理器强杀，系统代理会残留。下次启动会自动检测并从 `proxy-backup.txt` 恢复，
-> 也可以手动执行 `TlsFragProxy.exe --restore`。
-
-> 首次运行 Windows 可能弹「Windows 已保护你的电脑」，点 **更多信息 → 仍要运行**。程序没有数字签名。
-
-### 方式二：不需要编译，用 PowerShell 版
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\src\TlsFragProxy.ps1 -Delay 800 -Verbose
+```text
+TlsFragProxy.log     运行日志 / runtime log
+policy.txt           域名策略和最近成功的 IP / learned domain policy and last good IP
+proxy-backup.txt     系统代理备份 / system proxy backup
 ```
 
-然后手动把浏览器代理设成 `127.0.0.1:8899`。
+如果程序被强制结束，下一次启动会检查系统代理是否仍指向自己，并尝试从 `proxy-backup.txt` 恢复。也可以手动执行：
 
----
+If the process is force-terminated, the next launch checks for a leftover proxy pointing to itself and tries to restore `proxy-backup.txt`. You can also run:
 
-## 工作模式
-
-### 自动探测（默认，推荐）
-
-首次访问某个域名时先按**直连**试一次：
-
-- 服务器正常回应 → 记为 `direct`，以后一直直连，**零延时**
-- 被 RST → 记为 `blocked`，以后自动走分段（+800ms）
-
-结论保存在 `policy.txt`，重启不丢。
-
-这样做的原因是：按域名后缀猜白名单一定会误伤。一个淘宝页面能触发十几条分段请求，但其中很多子域其实没被封，白白多付 800ms。
-
-### 固定白名单
-
-```powershell
-.\TlsFragProxy.ps1 -Only "douyin.com,taobao.com" -NoProbe
+```bat
+TlsFragProxy.exe --restore
 ```
 
-给了 `-Only` 就关闭探测，只对命中的域名分段。`-Only "*"` 表示全部分段。
+`--restore` 只恢复系统代理，不启动代理服务；没有备份时会关闭系统代理。
 
-### 手动干预
+`--restore` only restores the system proxy and does not start the proxy. If no backup exists, it disables the system proxy.
 
-直接编辑 `policy.txt`（Tab 分隔）：
+## 自动探测 / Automatic probing
 
+**中文：** 默认第一次访问某个域名时先直连探测：
+
+**English:** On the first connection to a domain, the default mode probes a direct connection:
+
+- 收到 TLS ServerHello（`0x16`）时记录为 `direct`，以后不增加分片延迟。
+  A TLS ServerHello (`0x16`) is stored as `direct`, so later connections avoid the split delay.
+- 被 RST 或 Aborted，或收到 TLS Alert（`0x15`）时记录为 `blocked`，以后使用分片。
+  A reset, an aborted connection, or a TLS Alert (`0x15`) is stored as `blocked`, so later connections use fragmentation.
+- 其他首字节只继续转发，不立即写入结论。
+  Other first bytes are relayed without immediately storing a conclusion.
+
+学习结果保存在 `policy.txt`，重启后仍然有效。托盘菜单里的“重置学习结果”会清空策略。
+
+Results are stored in `policy.txt` and survive restarts. The tray menu item **Reset learned policy** clears them.
+
+也可以在启动时清空：
+
+You can also clear them at startup:
+
+```bat
+TlsFragProxy.exe --reset-policy
 ```
-host                    state      ip
-www.douyin.com          blocked    124.238.251.98
-img.alicdn.com          direct     111.47.237.52
+
+## 参数 / Options
+
+| 参数 / Option | 默认值 / Default | 说明 / Description |
+|---|---:|---|
+| `--port` | `8899` | 本地监听端口 / local listening port |
+| `--delay` | `800` | 两段 ClientHello 之间的等待毫秒数 / delay between ClientHello writes in milliseconds |
+| `--connect-timeout` | `4000` | 单个目标 IP 的 TCP 建连超时 / TCP connect timeout per destination IP |
+| `--probe-timeout` | `2500` | 自动探测等待目标首字节的时间 / time to wait for the first probe byte |
+| `--no-proxy` | off | 不修改 Windows 系统代理 / do not change the Windows system proxy |
+| `--reset-policy` | off | 启动时删除 `policy.txt` / delete `policy.txt` at startup |
+| `--restore` | — | 只恢复系统代理 / restore the system proxy only |
+
+示例 / Examples:
+
+```bat
+TlsFragProxy.exe --delay 1000
+TlsFragProxy.exe --port 8898 --no-proxy
+TlsFragProxy.exe --reset-policy
 ```
 
-改完重启程序生效。
+## 代理能力 / Proxy modes
 
----
+**中文：** exe 只监听 `127.0.0.1`，支持：
 
-## 参数
+**English:** The exe listens only on `127.0.0.1` and supports:
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--port` | 8899 | 本地监听端口 |
-| `--delay` | 800 | 分段延时（毫秒）。低于 400 会不稳 |
-| `--connect-timeout` | 4000 | 单 IP 建连超时，多 A 记录会逐个回退 |
-| `--probe-timeout` | 2500 | 首次探测等待服务器首字节的时间 |
-| `--no-proxy` | 关 | 不接管系统代理（自己用扩展或 Clash 管） |
-| `--reset-policy` | 关 | 启动时清空学习结果 |
-| `--restore` | — | 不启动代理，只把系统代理恢复成备份里的值（进程被强杀后用） |
+- HTTP CONNECT 隧道 / HTTP CONNECT tunnels;
+- SOCKS5（IPv4、IPv6 和域名）/ SOCKS5 with IPv4, IPv6, and domain targets;
+- 普通 HTTP forward proxy / ordinary HTTP forward proxy;
+- 多个 A 记录逐个尝试，并记录最近一次成功的 IP / trying multiple A records and remembering the last successful IP.
 
----
+只有 CONNECT 隧道中的 TLS ClientHello 会被分片。普通 HTTP 请求直接转发。
 
-## 和 Clash / V2Ray 共存
+Only TLS ClientHellos inside CONNECT tunnels are fragmented. Ordinary HTTP requests are forwarded directly.
 
-这类软件会周期性重写 `HKCU\...\Internet Settings\ProxyServer`，和本程序抢同一个注册表项。直接同时开会出现「设置完立刻被改回去」。
+## 和 Clash / Mihomo 共存 / Using it with Clash or Mihomo
 
-**推荐做法：让 Clash 管分流，本程序只管分片。**
+**中文：** 如果 Clash 或 Mihomo 管理系统代理，建议让它负责系统代理和分流，TlsFragProxy 只作为本地 HTTP 上游：
 
-1. 本程序带 `--no-proxy` 启动，不碰系统代理
-2. Clash 配置里把本程序加成上游：
+**English:** If Clash or Mihomo manages the system proxy, let it own system-proxy settings and routing, and run TlsFragProxy as a local HTTP upstream:
+
+```bat
+TlsFragProxy.exe --no-proxy
+```
+
+配置示例 / Example configuration:
 
 ```yaml
 proxies:
-  - name: "tlsfrag"
+  - name: tlsfrag
     type: http
     server: 127.0.0.1
     port: 8899
@@ -176,102 +164,87 @@ rules:
   - MATCH,DIRECT
 ```
 
-Clash 收到命中规则的请求后，会把 CONNECT 转发过来，本程序做完 TLS 分片再发出去。两边互不干扰。
+## 日志和排查 / Logs and troubleshooting
 
----
+常见日志标记 / Common log markers:
 
-## 常见问题
-
-### 打开后系统代理没生效，还得手动设
-
-托盘菜单里有一项直接显示真实状态：
-
-```
-系统代理: 开 -> 127.0.0.1:8899      ← 正常
-系统代理: 开 -> 127.0.0.1:7897      ← 被别的软件抢了
-系统代理: 关                        ← 没写进去
+```text
+[PASS]  直连成功或继续直连 / direct or continued relay
+[FRAG]  使用 TLS ClientHello 分片 / TLS ClientHello fragmentation
+[PASS?] 未确认被重置，继续直连 / no confirmed reset, continue direct
+[x]     当前 IP 失败，尝试下一个 / current IP failed, try the next one
+[X ]    所有解析到的 IP 都失败 / all resolved IPs failed
+[HTTP]  普通 HTTP 转发 / ordinary HTTP forwarding
 ```
 
-看 `TlsFragProxy.log` 里这一行：
+排查顺序 / Suggested order:
 
-```
-系统代理写入回读: 开 -> 127.0.0.1:8899
-```
+1. **中文：** 先看 `[X ]`。如果目标 IP 完全不可达，需要真实上游代理。
+   **English:** Check `[X ]` first. If every destination IP is unreachable, use a real upstream proxy.
+2. **中文：** 看 `[FRAG]` 后是否仍失败。仍失败可能表示延迟不合适，或封锁方式不是 SNI 重组超时。
+   **English:** If the connection still fails after `[FRAG]`, the delay may not fit the network, or the block may not be SNI reassembly based.
+3. **中文：** 如果策略学错，删除 `policy.txt` 或运行 `--reset-policy`。
+   **English:** If a policy was learned incorrectly, delete `policy.txt` or run `--reset-policy`.
+4. **中文：** 如果系统代理显示其他端口，说明 Clash、浏览器扩展或安全软件接管了系统代理。
+   **English:** If the system proxy shows another port, Clash, a browser extension, or security software has taken it over.
 
-- 显示正常但浏览器不走 → 检查浏览器扩展（SwitchyOmega 设成「直接连接」会忽略系统代理），或重启浏览器
-- 显示被改成 `7897` 之类 → 被 Clash 抢了，见上一节
-- 显示「无法读取注册表」 → 安全软件拦截，改用 `--no-proxy`
+## 安全边界和隐私 / Security and privacy
 
-### 某些网站开了代理反而打不开
+- **中文：** 程序只监听 `127.0.0.1`，不会主动监听局域网或公网地址。
+  **English:** The program listens only on `127.0.0.1` and does not listen on the LAN or the public network.
+- **中文：** 本地端口没有账号认证；本机其他程序可以使用这个 HTTP/SOCKS5 代理。不要把端口映射到局域网或公网。
+  **English:** The local port has no authentication. Other programs on the same computer can use the HTTP/SOCKS5 proxy. Do not expose or forward the port.
+- **中文：** exe 不上传请求内容，也不保存 TLS 明文；日志主要记录域名、目标 IP、状态和错误类型。
+  **English:** The exe does not upload request bodies or store TLS plaintext. Logs mainly contain domains, destination IPs, states, and error types.
+- **中文：** 建议把 exe 放在当前用户独占且可写的目录，不要放在所有账户都可写的共享目录。
+  **English:** Keep the exe in a writable directory owned by the current user, rather than a directory writable by every account.
+- **中文：** 诊断脚本会访问公共 DoH 和公网 IP 查询服务；运行敏感域名诊断前请确认接受这种外部查询。
+  **English:** The diagnostic scripts query public DoH and public-IP services. Check the privacy implications before running them for sensitive domains.
 
-典型是双 A 记录的站点：一个 IP 被网络黑洞、另一个正常。浏览器会自动换，但只取首个 IP 的实现会卡死。本程序会**逐个尝试所有 A 记录**并把成功的那个记进 `policy.txt`。
+## 构建 / Build
 
-如果仍然打不开，看日志里的 `[X ]`：
+Windows 自带的 .NET Framework C# 编译器即可构建，不需要 Visual Studio：
 
-```
-[X ] example.com 全部 IP 不可达
-```
-
-说明该站点在这条网络上确实不通，与被封锁无关。
-
-### 部分站点没有变快
-
-自动探测需要一轮学习。每个新域名第一次访问会多一次探测往返，之后走缓存。刷两遍就稳定了。
-
-### 延时到底该设多少
-
-800ms 是实测最优值。400ms 在阈值边缘，会出现偶发失败——而一次失败触发的浏览器重试比 800ms 本身更伤体验。
-
----
-
-## 自行构建
-
-不需要装 Visual Studio，用 Windows 自带的 C# 编译器：
+The .NET Framework C# compiler included with Windows is sufficient; Visual Studio is not required:
 
 ```bat
 build.bat
 ```
 
-或者手动：
+构建脚本会把 `assets\TlsFragProxy.ico` 嵌入 exe，托盘也会读取 exe 自带图标。
 
-```bat
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe ^
-  /target:winexe /platform:anycpu /optimize+ ^
-  /r:System.dll /r:System.Core.dll ^
-  /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
-  /out:TlsFragProxy.exe src\TlsFragProxy.cs
-```
+The build script embeds `assets\TlsFragProxy.ico` into the exe, and the tray uses the same associated icon.
 
-产物约 22 KB，不依赖任何运行库安装包（.NET Framework 4.x 是 Windows 10/11 自带组件）。
+项目使用 .NET Framework 4.x、Windows Forms、注册表和 TCP 套接字，没有第三方运行时依赖。
 
----
+The project uses .NET Framework 4.x, Windows Forms, the Windows registry, and TCP sockets. It has no third-party runtime dependency.
 
-## 目录结构
+## 项目结构 / Project layout
 
-```
+```text
 .
-├── src/
-│   ├── TlsFragProxy.cs      主程序（C#，托盘 + 代理引擎，单文件）
-│   └── TlsFragProxy.ps1     PowerShell 版，免编译
-├── tools/
-│   ├── sni_probe.ps1        SNI 分片探针：扫描「切点 × 延时」矩阵，判断本网络是否可用本方案
-│   └── school-net-diag.ps1  网络诊断：逐目标判定封锁发生在 DNS / IP / SNI / 网关 HTTP 哪一层
-├── docs/
-│   ├── how-it-works.md      原理、实测数据、方法论
-│   └── troubleshoot.md      排查手册
-├── build.bat
+├── src\TlsFragProxy.cs        exe 主程序 / exe source
+├── assets\TlsFragProxy.svg    图标源文件 / icon source
+├── assets\TlsFragProxy.ico    Windows 多尺寸图标 / Windows icon
+├── assets\TlsFragProxy.png    README 预览图 / README preview
+├── tools\sni_probe.ps1        SNI 分片探针 / SNI probe
+├── tools\school-net-diag.ps1  网络诊断工具 / network diagnostics
+├── docs\how-it-works.md       原理文档 / technical notes
+├── docs\troubleshoot.md       排查手册 / troubleshooting guide
+├── build.bat                  构建脚本 / build script
 └── README.md
 ```
 
-**建议先跑 `tools\sni_probe.ps1 -Scan`** —— 如果矩阵里没有任何 `P`，说明这条网络的封锁不是重组超时型的，本方案不适用，别浪费时间。
+## 限制 / Limitations
 
----
-
-## 使用范围
-
-本项目用于诊断和访问自有网络环境下的正常业务站点。请自行确认所在网络的使用条款，以及在当地法律框架内使用。
-
----
+- **中文：** 分片只能绕过特定类型的 SNI/DPI 阻断；它不是 VPN 或境外代理出口。
+  **English:** Fragmentation only helps with specific SNI/DPI blocks; it is not a VPN or overseas proxy.
+- **中文：** 第一次访问新域名需要自动探测，可能比后续连接慢。
+  **English:** The first connection to a new domain may be slower because it is probed.
+- **中文：** 多个 IP 都不可达时，程序只能失败并返回 502。
+  **English:** If all destination IPs are unreachable, the proxy can only fail with HTTP 502.
+- **中文：** 过低的 `--delay` 可能落回网关的重组窗口；默认值为 800 ms。
+  **English:** A low `--delay` may fall back inside the gateway's reassembly window; the default is 800 ms.
 
 ## License
 

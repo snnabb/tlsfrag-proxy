@@ -11,6 +11,7 @@ setlocal
 set "ROOT=%~dp0"
 set "SRC=%ROOT%src\TlsFragProxy.cs"
 set "OUT=%ROOT%TlsFragProxy.exe"
+set "ICON=%ROOT%assets\TlsFragProxy.ico"
 
 set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if not exist "%CSC%" set "CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe"
@@ -27,6 +28,12 @@ if not exist "%SRC%" (
     exit /b 1
 )
 
+if not exist "%ICON%" (
+    echo [x] icon not found: %ICON%
+    pause
+    exit /b 1
+)
+
 echo Compiler : %CSC%
 echo Source   : %SRC%
 echo Output   : %OUT%
@@ -35,7 +42,7 @@ echo.
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ ^
     /r:System.dll /r:System.Core.dll ^
     /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
-    /out:"%OUT%" "%SRC%"
+    /win32icon:"%ICON%" /out:"%OUT%" "%SRC%"
 
 if errorlevel 1 (
     echo.

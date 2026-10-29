@@ -24,6 +24,7 @@ jobs:
           "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ ^
             /r:System.dll /r:System.Core.dll ^
             /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
+            /win32icon:assets\TlsFragProxy.ico ^
             /out:TlsFragProxy.exe src\TlsFragProxy.cs
           if errorlevel 1 exit /b 1
 

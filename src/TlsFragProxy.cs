@@ -838,7 +838,7 @@ namespace TlsFrag
             menu.Items.Add(exitItem);
 
             _icon = new NotifyIcon();
-            _icon.Icon = SystemIcons.Application;
+            _icon.Icon = LoadTrayIcon() ?? SystemIcons.Application;
             _icon.Text = "TlsFragProxy  " + _c.Port;
             _icon.ContextMenuStrip = menu;
             _icon.Visible = true;
@@ -880,6 +880,12 @@ namespace TlsFrag
                 }
             }
             else _warned = false;
+        }
+
+        private static Icon LoadTrayIcon()
+        {
+            try { return Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch { return null; }
         }
 
         private void OpenLog()

@@ -1,5 +1,11 @@
 ﻿# Changelog
 
+## [0.4.2] - 2026-10-29
+
+发布整理：新增 Windows 多尺寸应用图标、托盘图标加载和中英双语 README；核心代理行为保持不变。
+
+Release polish: added a multi-size Windows application icon, associated tray icon loading, and a bilingual README. Core proxy behavior is unchanged.
+
 ## [0.4.1] - 2026-10-29
 
 代码评审后的修复。六项里有五项属实，一项修正了判定标准。
