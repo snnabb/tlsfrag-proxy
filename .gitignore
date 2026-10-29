@@ -1,22 +1,24 @@
-# 构建产物
+# build output
 *.exe
 *.pdb
 dist/
 bin/
 obj/
 
-# 运行时生成
+# runtime state (generated next to the executable)
 policy.txt
+policy.txt.tmp
+proxy-backup.txt
 TlsFragProxy.log
 *.log
 
-# 编辑器
+# editors
 .vs/
 .vscode/
 *.user
 *.suo
 .idea/
 
-# 系统
+# os
 Thumbs.db
 desktop.ini

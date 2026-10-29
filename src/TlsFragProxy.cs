@@ -27,6 +27,7 @@ namespace TlsFrag
         public string BaseDir;
         public string PolicyFile { get { return Path.Combine(BaseDir, "policy.txt"); } }
         public string LogFile { get { return Path.Combine(BaseDir, "TlsFragProxy.log"); } }
+        public string BackupFile { get { return Path.Combine(BaseDir, "proxy-backup.txt"); } }
     }
 
     // ===================== 日志 =====================
@@ -86,15 +87,23 @@ namespace TlsFrag
             catch { }
         }
 
+        private static readonly object _policyLock = new object();
+
         private void SavePolicy()
         {
-            try
+            lock (_policyLock)
             {
-                List<string> lines = new List<string>();
-                foreach (KeyValuePair<string, Pol> kv in _policy) lines.Add(kv.Key + "\t" + kv.Value.State + "\t" + kv.Value.Ip);
-                File.WriteAllLines(_c.PolicyFile, lines.ToArray(), Encoding.Default);
+                try
+                {
+                    List<string> lines = new List<string>();
+                    foreach (KeyValuePair<string, Pol> kv in _policy) lines.Add(kv.Key + "\t" + kv.Value.State + "\t" + kv.Value.Ip);
+                    string tmp = _c.PolicyFile + ".tmp";
+                    File.WriteAllLines(tmp, lines.ToArray(), Encoding.Default);
+                    if (File.Exists(_c.PolicyFile)) File.Delete(_c.PolicyFile);
+                    File.Move(tmp, _c.PolicyFile);
+                }
+                catch { }
             }
-            catch { }
         }
 
         public void ResetPolicy()
@@ -255,7 +264,7 @@ namespace TlsFrag
                     if (upstream == null) { Fail502(cs, client); return; }
                     byte[] ok = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\nProxy-Agent: TlsFragProxy\r\n\r\n");
                     cs.Write(ok, 0, ok.Length); cs.Flush();
-                    DoTunnel(cs, upstream, host);
+                    DoTunnel(cs, upstream, host, port);
                     return;
                 }
 
@@ -279,7 +288,7 @@ namespace TlsFrag
             }
         }
 
-        private void DoTunnel(NetworkStream cs, TcpClient upstream, string host)
+        private void DoTunnel(NetworkStream cs, TcpClient upstream, string host, int port)
         {
             NetworkStream us = upstream.GetStream();
             byte[] hello = ReadFirstRecord(cs);
@@ -317,22 +326,34 @@ namespace TlsFrag
             catch { }
             try { us.ReadTimeout = Timeout.Infinite; } catch { }
 
-            if (head >= 0)
+            // 0x16 = ServerHello：直连确实可用，可以记录
+            // 0x15 = TLS Alert：可能来自服务器，也可能来自网关自己，无法区分；
+            //        按「需分段」处理更安全 —— 分段对服务器端的真实拒绝没有副作用
+            // 其它首字节：不足以判定，只放行、不记录结论
+            if (head == 0x16)
             {
                 SetPol(host, "direct", GetPol(host).Ip);
-                Log.W("  [PASS] " + host + "  (探测:直连可用，已记录)");
+                Log.W("  [PASS] " + host + "  (探测:直连收到 ServerHello，已记录)");
                 cs.Write(new byte[] { (byte)head }, 0, 1); cs.Flush();
                 RelayBoth(cs, us);
                 return;
             }
+            if (head >= 0 && head != 0x15)
+            {
+                Log.W("  [PASS] " + host + "  (探测:首字节 0x" + head.ToString("X2") + "，不记录结论)");
+                cs.Write(new byte[] { (byte)head }, 0, 1); cs.Flush();
+                RelayBoth(cs, us);
+                return;
+            }
+            if (head == 0x15) rst = true;
 
             if (rst)
             {
                 SetPol(host, "blocked", GetPol(host).Ip);
-                Log.W("  [FRAG] " + host + "  (探测:直连被 RST，改用分段)");
+                Log.W("  [FRAG] " + host + "  (探测:" + (head == 0x15 ? "直连收到 TLS Alert" : "直连被 RST") + "，改用分段)");
                 FragTotal++;
                 try { upstream.Close(); } catch { }
-                TcpClient again = OpenUpstream(host, 443);
+                TcpClient again = OpenUpstream(host, port);
                 if (again == null) { try { cs.Close(); } catch { } return; }
                 RunFrag(cs, again.GetStream(), hello);
                 return;
@@ -393,7 +414,7 @@ namespace TlsFrag
                 }
                 cs.Write(new byte[] { 0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, 0, 10);
                 cs.Flush();
-                DoTunnel(cs, upstream, host);
+                DoTunnel(cs, upstream, host, port);
             }
             catch
             {
@@ -424,42 +445,57 @@ namespace TlsFrag
             return Encoding.ASCII.GetString(raw);
         }
 
+        // 读取一条完整的 ClientHello。RFC 8446 允许握手消息跨多个 TLS record，
+        // 所以这里按 record 循环累积，直到握手消息声明的长度收满为止。
         private byte[] ReadFirstRecord(NetworkStream cs)
         {
-            byte[] acc = new byte[32768];
-            int total = 0;
+            byte[] buf = new byte[32768];
+            int hdr = 0;        // 当前 record 头偏移
+            int pos = 0;        // 已读字节数
+            int payload = 0;    // 已收握手负载字节数
+            int hsDeclared = -1;
             try
             {
                 cs.ReadTimeout = 2500;
-                int n = cs.Read(acc, 0, acc.Length);
-                if (n <= 0) return null;
-                total = n;
-                if (acc[0] == 0x16 && total >= 5)
+                while (hdr + 5 <= buf.Length)
                 {
-                    int recLen = Be16(acc, 3) + 5;
-                    if (recLen > total && recLen <= acc.Length)
+                    while (pos < hdr + 5)
                     {
-                        try
-                        {
-                            while (total < recLen)
-                            {
-                                int m = cs.Read(acc, total, recLen - total);
-                                if (m <= 0) break;
-                                total += m;
-                            }
-                        }
-                        catch { }
+                        int n = cs.Read(buf, pos, hdr + 5 - pos);
+                        if (n <= 0) { cs.ReadTimeout = Timeout.Infinite; return Trim(buf, pos); }
+                        pos += n;
                     }
+                    if (hdr == 0 && buf[0] != 0x16) break;      // 不是 TLS 握手
+                    int recLen = Be16(buf, hdr + 3) + 5;
+                    if (recLen < 5 || hdr + recLen > buf.Length) break;
+                    while (pos < hdr + recLen)
+                    {
+                        int n = cs.Read(buf, pos, hdr + recLen - pos);
+                        if (n <= 0) { cs.ReadTimeout = Timeout.Infinite; return Trim(buf, pos); }
+                        pos += n;
+                    }
+                    payload += recLen - 5;
+                    if (hsDeclared < 0 && pos >= 9)
+                        hsDeclared = 4 + (((buf[6] & 0xFF) << 16) | ((buf[7] & 0xFF) << 8) | (buf[8] & 0xFF));
+                    if (hsDeclared >= 0 && payload >= hsDeclared) break;
+                    hdr += recLen;
                 }
                 cs.ReadTimeout = Timeout.Infinite;
-                byte[] res = new byte[total]; Array.Copy(acc, res, total); return res;
+                return Trim(buf, pos);
             }
             catch
             {
                 try { cs.ReadTimeout = Timeout.Infinite; } catch { }
-                if (total > 0) { byte[] res = new byte[total]; Array.Copy(acc, res, total); return res; }
-                return null;
+                return Trim(buf, pos);
             }
+        }
+
+        private static byte[] Trim(byte[] buf, int len)
+        {
+            if (len <= 0) return null;
+            byte[] res = new byte[len];
+            Array.Copy(buf, res, len);
+            return res;
         }
 
         private static int FindSniSplit(byte[] b, int len)
@@ -500,8 +536,13 @@ namespace TlsFrag
 
         private void RunFrag(NetworkStream cs, NetworkStream us, byte[] hello)
         {
-            int split = FindSniSplit(hello, hello.Length);
-            if (split <= 0 || split >= hello.Length) split = hello.Length / 2;
+            // FindSniSplit 假设握手字节连续，只在第一个 record 范围内成立。
+            // 若 SNI 落在后续 record，退化为第一 record 中点（仍能保证两段都不含完整域名）。
+            int firstRec = (hello.Length >= 5) ? (Be16(hello, 3) + 5) : hello.Length;
+            if (firstRec > hello.Length || firstRec < 5) firstRec = hello.Length;
+            int split = FindSniSplit(hello, firstRec);
+            if (split <= 0) split = FindSniSplit(hello, hello.Length);
+            if (split <= 0 || split >= hello.Length) split = firstRec > 10 ? firstRec / 2 : hello.Length / 2;
             us.Write(hello, 0, split); us.Flush();
             if (_c.Delay > 0) Thread.Sleep(_c.Delay);
             us.Write(hello, split, hello.Length - split); us.Flush();
@@ -510,8 +551,8 @@ namespace TlsFrag
 
         private void RelayBoth(NetworkStream cs, NetworkStream us)
         {
-            Thread up = new Thread(delegate() { Pump(cs, us); });
-            Thread down = new Thread(delegate() { Pump(us, cs); });
+            Thread up = new Thread(delegate() { Pump(cs, us); }, 256 * 1024);
+            Thread down = new Thread(delegate() { Pump(us, cs); }, 256 * 1024);
             up.IsBackground = true; down.IsBackground = true;
             up.Start(); down.Start();
             up.Join();
@@ -624,8 +665,48 @@ namespace TlsFrag
             catch { return false; }
         }
 
+        public static string BackupPath;
+
+        public static Snapshot LoadBackup()
+        {
+            try
+            {
+                if (BackupPath == null || !File.Exists(BackupPath)) return null;
+                string[] l = File.ReadAllLines(BackupPath, Encoding.Default);
+                if (l.Length < 1) return null;
+                Snapshot s = new Snapshot();
+                s.Enable = int.Parse(l[0].Trim());
+                s.Server = l.Length > 1 ? l[1] : null;
+                s.Override = l.Length > 2 ? l[2] : null;
+                s.Valid = true;
+                return s;
+            }
+            catch { return null; }
+        }
+
+        // 把当前系统代理设置备份到文件，供崩溃后下次启动恢复
+        public static void SaveBackup(Snapshot s)
+        {
+            try
+            {
+                if (BackupPath == null || s == null || !s.Valid) return;
+                File.WriteAllLines(BackupPath, new string[] {
+                    s.Enable.ToString(),
+                    s.Server == null ? "" : s.Server,
+                    s.Override == null ? "" : s.Override
+                }, Encoding.Default);
+            }
+            catch { }
+        }
+
+        public static void DropBackup()
+        {
+            try { if (BackupPath != null && File.Exists(BackupPath)) File.Delete(BackupPath); } catch { }
+        }
+
         public static void Apply(int port)
         {
+            SaveBackup(Capture());
             using (RegistryKey k = Registry.CurrentUser.OpenSubKey(Key, true))
             {
                 if (k == null) return;
@@ -655,6 +736,7 @@ namespace TlsFrag
                 }
             }
             catch { }
+            DropBackup();
             Refresh();
         }
     }
@@ -675,6 +757,26 @@ namespace TlsFrag
         public TrayApp(Cfg c)
         {
             _c = c;
+            SysProxy.BackupPath = _c.BackupFile;
+
+            // 上次被强杀时系统代理可能仍指向我们的端口，先从备份恢复
+            if (SysProxy.IsPointingTo(_c.Port))
+            {
+                SysProxy.Snapshot prev = SysProxy.LoadBackup();
+                if (prev != null)
+                {
+                    SysProxy.Restore(prev);
+                    Log.W("检测到上次异常退出残留的系统代理，已从 proxy-backup.txt 恢复");
+                }
+                else
+                {
+                    SysProxy.Snapshot off = new SysProxy.Snapshot();
+                    off.Valid = true;
+                    off.Enable = 0;
+                    SysProxy.Restore(off);
+                    Log.W("检测到上次异常退出残留的系统代理，无备份可用，已关闭代理");
+                }
+            }
             _snap = SysProxy.Capture();
 
             _e = new Engine(_c);
@@ -830,6 +932,7 @@ namespace TlsFrag
         {
             Cfg c = new Cfg();
             c.BaseDir = AppDomain.CurrentDomain.BaseDirectory;
+            bool restoreOnly = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -840,10 +943,29 @@ namespace TlsFrag
                 else if (a == "--probe-timeout" && i + 1 < args.Length) c.ProbeTimeout = int.Parse(args[++i]);
                 else if (a == "--no-proxy") c.ManageSystemProxy = false;
                 else if (a == "--reset-policy") c.ResetPolicy = true;
+                else if (a == "--restore") restoreOnly = true;
             }
 
             Log.FilePath = c.LogFile;
             Log.W("==== 启动 ====");
+
+            // 进程内有大量并发连接，每个连接会占用线程等待对端关闭
+            ThreadPool.SetMinThreads(64, 64);
+
+            if (restoreOnly)
+            {
+                SysProxy.BackupPath = c.BackupFile;
+                SysProxy.Snapshot b = SysProxy.LoadBackup();
+                if (b != null) { SysProxy.Restore(b); Console.WriteLine("[ok] system proxy restored from backup"); }
+                else
+                {
+                    SysProxy.Snapshot off = new SysProxy.Snapshot();
+                    off.Valid = true; off.Enable = 0;
+                    SysProxy.Restore(off);
+                    Console.WriteLine("[ok] no backup found, system proxy disabled");
+                }
+                return;
+            }
 
             if (c.ResetPolicy)
             {
